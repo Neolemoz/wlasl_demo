@@ -1,0 +1,17 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local heavy assets (must live under /home)
+data/
+weights/
+checkpoints/
+videos/
+outputs/
+cache/
+
+# Logs
+*.log

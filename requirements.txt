@@ -1,0 +1,8 @@
+numpy
+tqdm
+rich
+opencv-python
+
+# Torch CPU: installed via scripts/setup_venv.sh from the official CPU index
+torch
+torchvision
