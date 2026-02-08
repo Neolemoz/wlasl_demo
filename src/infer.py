@@ -1,0 +1,282 @@
+import argparse
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+import cv2
+import numpy as np
+import torch
+
+from . import paths
+
+
+DEFAULT_NUM_LABELS = 100
+DEFAULT_NUM_FRAMES = 16
+
+
+def load_labels(labels_path: Path, num_classes: int) -> list[str]:
+    if not labels_path.exists():
+        print(f"HINT: labels not found at {labels_path}. Using mock_<i> labels.")
+        print("      To use real labels, place weights/labels.json (list of strings) or pass --labels <path>.")
+        return [f"mock_{i}" for i in range(num_classes)]
+
+    try:
+        with labels_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as exc:
+        print(f"HINT: labels file malformed at {labels_path}. Using mock_<i> labels.")
+        return [f"mock_{i}" for i in range(num_classes)]
+
+    if isinstance(data, list) and all(isinstance(x, str) for x in data):
+        return data
+
+    if isinstance(data, dict):
+        items = []
+        try:
+            for k, v in data.items():
+                items.append((int(k), str(v)))
+        except Exception as exc:
+            print(f"HINT: labels file malformed at {labels_path}. Using mock_<i> labels.")
+            return [f"mock_{i}" for i in range(num_classes)]
+        items.sort(key=lambda x: x[0])
+        return [label for _, label in items]
+
+    print(f"HINT: labels file malformed at {labels_path}. Using mock_<i> labels.")
+    return [f"mock_{i}" for i in range(num_classes)]
+
+
+def _resize_rgb(frame_bgr: np.ndarray, size: int = 224) -> np.ndarray:
+    frame = cv2.resize(frame_bgr, (size, size), interpolation=cv2.INTER_AREA)
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    frame = frame.astype(np.float32) / 255.0
+    return frame
+
+
+def decode_video_to_tensor(video_path: Path, num_frames: int = DEFAULT_NUM_FRAMES) -> torch.Tensor:
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open video: {video_path}")
+
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frames = []
+
+    if total > 0:
+        indices = np.linspace(0, total - 1, num=num_frames, dtype=int)
+        for idx in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+            frames.append(_resize_rgb(frame))
+    else:
+        while True:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+            frames.append(_resize_rgb(frame))
+
+        if frames:
+            indices = np.linspace(0, len(frames) - 1, num=num_frames, dtype=int)
+            frames = [frames[i] for i in indices]
+
+    cap.release()
+
+    if not frames:
+        raise ValueError("No frames read from video.")
+
+    arr = np.stack(frames, axis=0)  # [T, H, W, C]
+    arr = np.transpose(arr, (0, 3, 1, 2))  # [T, C, H, W]
+    arr = np.expand_dims(arr, axis=0)  # [1, T, C, H, W]
+    return torch.from_numpy(arr).float()
+
+
+def _fingerprint_from_tensor(video_tensor: torch.Tensor) -> np.ndarray:
+    data = video_tensor.squeeze(0).permute(0, 2, 3, 1).cpu().numpy()  # [T, H, W, C]
+    mean_rgb = data.mean(axis=(0, 1, 2))
+    std_rgb = data.std(axis=(0, 1, 2))
+    if data.shape[0] > 1:
+        diffs = np.abs(data[1:] - data[:-1])
+        motion = float(diffs.mean())
+    else:
+        motion = 0.0
+    luma = (0.299 * data[..., 0] + 0.587 * data[..., 1] + 0.114 * data[..., 2]).mean()
+    features = np.concatenate([mean_rgb, std_rgb, np.array([motion, luma], dtype=np.float32)])
+    return features.astype(np.float32)
+
+
+def mock_predict_probs(video_tensor: torch.Tensor, num_labels: int) -> tuple[np.ndarray, int, float]:
+    features = _fingerprint_from_tensor(video_tensor)
+    digest = hashlib.sha256(features.tobytes()).digest()
+    seed = int.from_bytes(digest[:8], "little", signed=False)
+    rng = np.random.default_rng(seed)
+
+    logits = rng.normal(0.0, 1.0, size=(num_labels,)).astype(np.float32)
+    peak_count = 3
+    peak_indices = rng.choice(num_labels, size=peak_count, replace=False)
+    boosts = [5.0, 2.0, 1.2]
+    for i, idx in enumerate(peak_indices):
+        logits[idx] += boosts[i]
+
+    temperature = 0.95 + (seed % 26) / 100.0
+    scaled = logits / temperature
+    scaled = scaled - np.max(scaled)
+    exp = np.exp(scaled)
+    probs = exp / exp.sum()
+
+    probs = np.maximum(probs, 1e-6)
+    probs = probs / probs.sum()
+    return probs.astype(np.float32), seed, float(temperature)
+
+
+def load_torchscript_model(weights_path: Path) -> torch.jit.ScriptModule:
+    return torch.jit.load(str(weights_path), map_location="cpu")
+
+
+def run_inference(
+    video_tensor: torch.Tensor,
+    labels: list[str],
+    weights_path: Path,
+    use_mock: bool,
+) -> np.ndarray:
+    if use_mock:
+        probs, seed, temp = mock_predict_probs(video_tensor, len(labels))
+        print(f"[MOCK] seed={seed} temp={temp:.2f}")
+        return probs
+
+    if not weights_path.exists():
+        print(f"ERROR: model weights not found: {weights_path}")
+        print("HINT: place a TorchScript model at weights/model.ts or pass --weights <path>")
+        print("      TorchScript expected (torch.jit.load on CPU).")
+        sys.exit(2)
+
+    model = load_torchscript_model(weights_path)
+    model.eval()
+    with torch.no_grad():
+        outputs = model(video_tensor)
+    if isinstance(outputs, (list, tuple)):
+        outputs = outputs[0]
+    if isinstance(outputs, dict):
+        outputs = outputs.get("logits", None)
+    if outputs is None:
+        raise RuntimeError("Model output is invalid; expected logits tensor.")
+    if outputs.ndim == 2:
+        outputs = outputs[0]
+    probs = torch.softmax(outputs, dim=-1).cpu().numpy()
+    return probs.astype(np.float32)
+
+
+def _adjust_topk_for_display(
+    topk_probs: np.ndarray, min_tail: float = 0.02, max_sum: float = 0.90
+) -> np.ndarray:
+    display = topk_probs.copy()
+    if display.size >= 3:
+        p1 = float(display[0])
+        tail_floor = min_tail
+        if tail_floor >= p1 * 0.8:
+            tail_floor = max(0.005, p1 * 0.6)
+        display[2:] = np.maximum(display[2:], tail_floor)
+
+    target_sum = min(max_sum, float(topk_probs.sum()))
+    if target_sum <= 0:
+        return display
+
+    scale = target_sum / float(display.sum())
+    display = display * scale
+
+    if display.size >= 2:
+        p1 = float(display[0])
+        if display[1:].max() >= p1:
+            display[1:] = np.minimum(display[1:], p1 * 0.9)
+            display = display * (target_sum / float(display.sum()))
+
+    return display
+
+
+def format_topk(labels: list[str], probs: np.ndarray, topk: int, mock_display: bool = False) -> str:
+    topk = min(topk, len(labels))
+    indices = np.argsort(-probs)[:topk]
+    display_probs = probs[indices]
+    if mock_display:
+        display_probs = _adjust_topk_for_display(display_probs)
+    lines = []
+    for rank, idx in enumerate(indices, start=1):
+        label = labels[int(idx)]
+        prob = float(display_probs[rank - 1])
+        lines.append(f"  {rank}) {label:<12} {prob:.2f}")
+    return "\n".join(lines), int(indices[0]), float(display_probs[0])
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="CPU-only offline inference.")
+    parser.add_argument("--input", type=str, required=False, help="Path to input mp4.")
+    parser.add_argument("--topk", type=int, default=5)
+    parser.add_argument("--num_classes", type=int, default=DEFAULT_NUM_LABELS)
+    parser.add_argument("--weights", type=str, default=str(paths.WEIGHTS_DIR / "model.ts"))
+    parser.add_argument("--labels", type=str, default=str(paths.WEIGHTS_DIR / "labels.json"))
+    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--dry_run", action="store_true")
+    parser.add_argument("--mock", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    paths.ensure_dirs()
+
+    if args.device.lower() != "cpu":
+        print("ERROR: only --device cpu is supported.")
+        sys.exit(1)
+
+    input_path = Path(args.input) if args.input else None
+    weights_path = Path(args.weights)
+    labels_path = Path(args.labels)
+
+    if not args.dry_run and input_path is None:
+        print("ERROR: --input is required unless --dry_run is set.")
+        sys.exit(1)
+
+    if input_path is not None and not input_path.exists():
+        print(f"ERROR: input not found: {input_path}")
+        sys.exit(1)
+
+    if args.dry_run:
+        print("DRY_RUN: path validation")
+        if input_path is not None:
+            print(f"input: {input_path.resolve()}")
+        print(f"weights: {weights_path.resolve()}")
+        print(f"labels: {labels_path.resolve()}")
+        sys.exit(0)
+
+    num_classes = max(1, int(args.num_classes))
+    labels = load_labels(labels_path, num_classes)
+    topk = max(1, args.topk)
+
+    try:
+        video_tensor = decode_video_to_tensor(input_path)
+    except ValueError:
+        print("ERROR: video opened but no frames were read.")
+        sys.exit(3)
+    except Exception as exc:
+        print(f"ERROR: failed to decode video: {exc}")
+        sys.exit(3)
+
+    probs = run_inference(
+        video_tensor=video_tensor,
+        labels=labels,
+        weights_path=weights_path,
+        use_mock=args.mock,
+    )
+
+    tag = "MOCK" if args.mock else "REAL"
+    topk = min(topk, len(labels))
+    topk_text, top1_idx, top1_prob = format_topk(labels, probs, topk, mock_display=args.mock)
+    print(f"[{tag}] input: {input_path}")
+    print(f"pred: {labels[top1_idx]} ({top1_prob:.2f})")
+    print(f"top-{topk}:")
+    print(topk_text)
+    print(f"SUMMARY: mode={tag} input={input_path} top1={labels[top1_idx]}({top1_prob:.2f}) topk={topk}")
+
+
+if __name__ == "__main__":
+    main()
