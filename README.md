@@ -128,21 +128,28 @@ Open:
 http://127.0.0.1:3000
 ```
 
-## Demoday (one command)
+## Demoday (One Command)
 
+Steps:
+1. Start everything:
 ```bash
 ./scripts/demoday.sh
 ```
+2. Open browser:
+```bash
+http://127.0.0.1:3000
+```
 
-## REAL model slot (optional)
+Demo flow:
+- Upload MP4/WebM OR Record 2s Webcam
+- Default = MOCK (always works)
+- Toggle MOCK off to use REAL model (if weights present)
 
-Default demo uses MOCK.
-To use REAL:
-- Place TorchScript at `weights/model.ts`
-- Place labels at `weights/labels.json`
-- Toggle MOCK off in the UI
-
-If weights are missing, the UI will guide you back to MOCK.
+### REAL model setup
+- Place `weights/model.ts`
+- Place `weights/labels.json`
+- Files are ignored by git (do NOT commit)
+- If REAL is enabled without weights, the UI will guide you back to MOCK
 
 ## Step 7: Colab training + export
 

@@ -15,6 +15,8 @@ type InferResult = {
     fps: number | null;
     width: number | null;
     height: number | null;
+    num_classes?: number;
+    labels?: string[];
   };
 };
 
@@ -83,6 +85,8 @@ export default function Page() {
 
   const settingsText = useMemo(() => `mock=${mock} topk=${topk}`, [mock, topk]);
   const busy = status === "Recording" || status === "Uploading" || status === "Inferring";
+  const metaClasses = result?.meta?.num_classes ?? result?.meta?.labels?.length;
+  const metaFrames = result?.meta?.frames;
 
   useEffect(() => {
     let alive = true;
@@ -194,7 +198,18 @@ export default function Page() {
       </div>
 
       <div className="card stack">
-        <h2>Settings</h2>
+        <div className="row space">
+          <h2>Settings</h2>
+          <div className="panel row" style={{ gap: 10, padding: "6px 10px" }}>
+            <span className="badge">{mock ? "Model: MOCK" : "Model: REAL"}</span>
+            {!mock && typeof metaClasses === "number" && (
+              <span className="subtle">classes={metaClasses}</span>
+            )}
+            {!mock && typeof metaFrames === "number" && (
+              <span className="subtle">frames={metaFrames}</span>
+            )}
+          </div>
+        </div>
         <div className="row">
           <label className="label">Top‑K</label>
           <input
