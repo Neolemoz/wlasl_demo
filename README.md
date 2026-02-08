@@ -88,3 +88,58 @@ Examples:
 ./scripts/run_demo.sh --video videos/sample.mp4 --weights weights/model.ts --labels weights/labels.json
 ./scripts/run_demo.sh --webcam --preview --mock
 ```
+
+## Local Inference API
+
+Install deps:
+```bash
+pip install -r requirements.txt
+```
+
+Run server:
+```bash
+./scripts/run_server.sh
+```
+
+Test:
+```bash
+curl -s http://127.0.0.1:8000/health
+curl -s -X POST "http://127.0.0.1:8000/infer?mock=true&topk=5" -F "file=@videos/sample.mp4"
+```
+
+Notes:
+- `mock=true` by default for MVP.
+- Weights and labels must be placed manually under `weights/`.
+
+## Web UI (Next.js)
+
+Start API:
+```bash
+./scripts/run_server.sh
+```
+
+Start web:
+```bash
+./scripts/run_web.sh
+```
+
+Open:
+```bash
+http://127.0.0.1:3000
+```
+
+## Demoday (one command)
+
+```bash
+./scripts/demoday.sh
+```
+
+## REAL model slot (optional)
+
+Default demo uses MOCK.
+To use REAL:
+- Place TorchScript at `weights/model.ts`
+- Place labels at `weights/labels.json`
+- Toggle MOCK off in the UI
+
+If weights are missing, the UI will guide you back to MOCK.

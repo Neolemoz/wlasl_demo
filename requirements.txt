@@ -2,6 +2,9 @@ numpy
 tqdm
 rich
 opencv-python
+fastapi
+uvicorn[standard]
+python-multipart
 
 # Torch CPU: installed via scripts/setup_venv.sh from the official CPU index
 torch
