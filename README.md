@@ -143,3 +143,21 @@ To use REAL:
 - Toggle MOCK off in the UI
 
 If weights are missing, the UI will guide you back to MOCK.
+
+## Step 7: Colab training + export
+
+Train a tiny baseline on the Kaggle WLASL processed dataset and export TorchScript for CPU inference.
+Kaggle download requires a `kaggle.json` token and must be run in Colab.
+
+Use the notebook:
+- `colab/Step7_Colab_Train_Export.ipynb`
+
+Outputs from Colab:
+- `model.ts`
+- `labels.json`
+
+Place them locally:
+- `weights/model.ts`
+- `weights/labels.json`
+
+Then REAL mode works without any code changes.
