@@ -15,6 +15,14 @@ DEFAULT_NUM_LABELS = 100
 DEFAULT_NUM_FRAMES = 16
 
 
+class InferenceError(Exception):
+    def __init__(self, message: str, hint: str | None = None, code: int | None = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.hint = hint
+        self.code = code
+
+
 def load_labels(labels_path: Path, num_classes: int) -> list[str]:
     if not labels_path.exists():
         print(f"HINT: labels not found at {labels_path}. Using mock_<i> labels.")
@@ -53,12 +61,15 @@ def _resize_rgb(frame_bgr: np.ndarray, size: int = 224) -> np.ndarray:
     return frame
 
 
-def decode_video_to_tensor(video_path: Path, num_frames: int = DEFAULT_NUM_FRAMES) -> torch.Tensor:
+def decode_video_to_tensor(video_path: Path, num_frames: int = DEFAULT_NUM_FRAMES) -> tuple[torch.Tensor, dict]:
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video: {video_path}")
 
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = float(cap.get(cv2.CAP_PROP_FPS)) or None
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or None
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or None
     frames = []
 
     if total > 0:
@@ -88,7 +99,13 @@ def decode_video_to_tensor(video_path: Path, num_frames: int = DEFAULT_NUM_FRAME
     arr = np.stack(frames, axis=0)  # [T, H, W, C]
     arr = np.transpose(arr, (0, 3, 1, 2))  # [T, C, H, W]
     arr = np.expand_dims(arr, axis=0)  # [1, T, C, H, W]
-    return torch.from_numpy(arr).float()
+    meta = {
+        "frames": len(frames),
+        "fps": fps,
+        "width": width,
+        "height": height,
+    }
+    return torch.from_numpy(arr).float(), meta
 
 
 def _fingerprint_from_tensor(video_tensor: torch.Tensor) -> np.ndarray:
@@ -138,17 +155,18 @@ def run_inference(
     labels: list[str],
     weights_path: Path,
     use_mock: bool,
-) -> np.ndarray:
+) -> tuple[np.ndarray, int | None, float | None]:
     if use_mock:
         probs, seed, temp = mock_predict_probs(video_tensor, len(labels))
-        print(f"[MOCK] seed={seed} temp={temp:.2f}")
-        return probs
+        return probs, seed, temp
 
     if not weights_path.exists():
-        print(f"ERROR: model weights not found: {weights_path}")
-        print("HINT: place a TorchScript model at weights/model.ts or pass --weights <path>")
-        print("      TorchScript expected (torch.jit.load on CPU).")
-        sys.exit(2)
+        raise InferenceError(
+            message=f"ERROR: model weights not found: {weights_path}",
+            hint="HINT: place a TorchScript model at weights/model.ts or pass --weights <path>\n"
+            "      TorchScript expected (torch.jit.load on CPU).",
+            code=2,
+        )
 
     model = load_torchscript_model(weights_path)
     model.eval()
@@ -163,7 +181,7 @@ def run_inference(
     if outputs.ndim == 2:
         outputs = outputs[0]
     probs = torch.softmax(outputs, dim=-1).cpu().numpy()
-    return probs.astype(np.float32)
+    return probs.astype(np.float32), None, None
 
 
 def _adjust_topk_for_display(
@@ -207,6 +225,85 @@ def format_topk(labels: list[str], probs: np.ndarray, topk: int, mock_display: b
     return "\n".join(lines), int(indices[0]), float(display_probs[0])
 
 
+def _infer_core(
+    input_path: str,
+    topk: int,
+    mock: bool,
+    weights_path: str | None,
+    labels_path: str | None,
+    num_classes: int,
+) -> tuple[np.ndarray, list[str], dict, str, int | None, float | None]:
+    paths.ensure_dirs()
+
+    input_p = Path(input_path)
+    if not input_p.exists():
+        raise InferenceError(message=f"ERROR: input not found: {input_p}", code=1)
+
+    labels_p = Path(labels_path) if labels_path else paths.WEIGHTS_DIR / "labels.json"
+    weights_p = Path(weights_path) if weights_path else paths.WEIGHTS_DIR / "model.ts"
+
+    labels = load_labels(labels_p, max(1, int(num_classes)))
+    video_tensor, meta = decode_video_to_tensor(input_p)
+
+    probs, seed, temp = run_inference(
+        video_tensor=video_tensor,
+        labels=labels,
+        weights_path=weights_p,
+        use_mock=mock,
+    )
+
+    meta = {
+        "seed": seed,
+        "temp": temp,
+        "frames": int(meta.get("frames", 0)),
+        "fps": meta.get("fps", None),
+        "width": meta.get("width", None),
+        "height": meta.get("height", None),
+    }
+    mode = "MOCK" if mock else "REAL"
+    return probs, labels, meta, mode, seed, temp
+
+
+def infer_video(
+    input_path: str,
+    topk: int = 5,
+    mock: bool = True,
+    weights_path: str | None = None,
+    labels_path: str | None = None,
+    num_classes: int = 100,
+) -> dict:
+    probs, labels, meta, mode, _, _ = _infer_core(
+        input_path=input_path,
+        topk=topk,
+        mock=mock,
+        weights_path=weights_path,
+        labels_path=labels_path,
+        num_classes=num_classes,
+    )
+
+    topk = min(max(1, int(topk)), len(labels))
+    indices = np.argsort(-probs)[:topk]
+    topk_list = []
+    for rank, idx in enumerate(indices, start=1):
+        topk_list.append(
+            {
+                "rank": rank,
+                "label": labels[int(idx)],
+                "prob": float(probs[int(idx)]),
+            }
+        )
+
+    top1_idx = int(indices[0])
+    return {
+        "mode": mode,
+        "input": input_path,
+        "pred_label": labels[top1_idx],
+        "pred_prob": float(probs[top1_idx]),
+        "topk": topk_list,
+        "meta": meta,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="CPU-only offline inference.")
     parser.add_argument("--input", type=str, required=False, help="Path to input mp4.")
@@ -222,7 +319,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    paths.ensure_dirs()
 
     if args.device.lower() != "cpu":
         print("ERROR: only --device cpu is supported.")
@@ -236,10 +332,6 @@ def main() -> None:
         print("ERROR: --input is required unless --dry_run is set.")
         sys.exit(1)
 
-    if input_path is not None and not input_path.exists():
-        print(f"ERROR: input not found: {input_path}")
-        sys.exit(1)
-
     if args.dry_run:
         print("DRY_RUN: path validation")
         if input_path is not None:
@@ -249,11 +341,24 @@ def main() -> None:
         sys.exit(0)
 
     num_classes = max(1, int(args.num_classes))
-    labels = load_labels(labels_path, num_classes)
-    topk = max(1, args.topk)
+    if input_path is None:
+        print("ERROR: --input is required unless --dry_run is set.")
+        sys.exit(1)
 
     try:
-        video_tensor = decode_video_to_tensor(input_path)
+        probs, labels, meta, tag, seed, temp = _infer_core(
+            input_path=str(input_path),
+            topk=max(1, args.topk),
+            mock=args.mock,
+            weights_path=str(weights_path),
+            labels_path=str(labels_path),
+            num_classes=num_classes,
+        )
+    except InferenceError as exc:
+        print(exc.message)
+        if exc.hint:
+            print(exc.hint)
+        sys.exit(exc.code if exc.code is not None else 1)
     except ValueError:
         print("ERROR: video opened but no frames were read.")
         sys.exit(3)
@@ -261,15 +366,10 @@ def main() -> None:
         print(f"ERROR: failed to decode video: {exc}")
         sys.exit(3)
 
-    probs = run_inference(
-        video_tensor=video_tensor,
-        labels=labels,
-        weights_path=weights_path,
-        use_mock=args.mock,
-    )
+    if args.mock and seed is not None and temp is not None:
+        print(f"[MOCK] seed={seed} temp={temp:.2f}")
 
-    tag = "MOCK" if args.mock else "REAL"
-    topk = min(topk, len(labels))
+    topk = min(max(1, args.topk), len(labels))
     topk_text, top1_idx, top1_prob = format_topk(labels, probs, topk, mock_display=args.mock)
     print(f"[{tag}] input: {input_path}")
     print(f"pred: {labels[top1_idx]} ({top1_prob:.2f})")
