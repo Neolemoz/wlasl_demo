@@ -31,6 +31,8 @@ def infer(
     weights: str = "weights/model.ts",
     labels: str = "weights/labels.json",
     num_classes: int = 100,
+    confidence_threshold: float = 0.50,
+    margin_threshold: float = 0.15,
 ) -> dict:
     if not file.filename:
         return JSONResponse(
@@ -86,6 +88,8 @@ def infer(
             weights_path=weights,
             labels_path=labels,
             num_classes=num_classes,
+            confidence_threshold=confidence_threshold,
+            margin_threshold=margin_threshold,
         )
         return result
     except InferenceError as exc:
@@ -94,9 +98,15 @@ def infer(
             content["hint"] = exc.hint
         return JSONResponse(status_code=400, content=content)
     except ValueError as exc:
+        message = str(exc)
+        if "No frames read from video" in message:
+            return JSONResponse(
+                status_code=400,
+                content={"error": message, "hint": "Check video decoding.", "code": "DECODE_ERROR"},
+            )
         return JSONResponse(
             status_code=400,
-            content={"error": str(exc), "hint": "Check video decoding.", "code": "DECODE_ERROR"},
+            content={"error": message, "code": "BAD_REQUEST"},
         )
     except Exception as exc:
         return JSONResponse(

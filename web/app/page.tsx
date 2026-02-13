@@ -1,14 +1,17 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 type InferResult = {
-  mode: string;
-  input: string;
-  pred_label: string;
-  pred_prob: number;
-  topk: { rank: number; label: string; prob: number }[];
-  meta: {
+  status: "ok" | "unknown";
+  reason: "low_confidence" | "ambiguous" | null;
+  top1: { label: string; score: number };
+  topk: { label: string; score: number }[];
+  confidence_threshold: number;
+  margin_threshold: number;
+  mode?: string;
+  input?: string;
+  meta?: {
     seed: number | null;
     temp: number | null;
     frames: number;
@@ -82,6 +85,11 @@ export default function Page() {
   const [error, setError] = useState<string>("");
   const [realError, setRealError] = useState<{ error: string; hint?: string } | null>(null);
   const [apiOk, setApiOk] = useState<boolean | null>(null);
+  const [isRecording, setIsRecording] = useState(false);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<BlobPart[]>([]);
 
   const settingsText = useMemo(() => `mock=${mock} topk=${topk}`, [mock, topk]);
   const busy = status === "Recording" || status === "Uploading" || status === "Inferring";
@@ -102,6 +110,54 @@ export default function Page() {
       });
     return () => {
       alive = false;
+    };
+  }, []);
+
+  function stopStream() {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+  }
+
+  function webcamErrorMessage(err: unknown): string {
+    if (err instanceof DOMException) {
+      if (err.name === "NotAllowedError" || err.name === "PermissionDeniedError") {
+        return "Camera permission denied. Please allow camera access and try again.";
+      }
+      if (err.name === "NotFoundError" || err.name === "DevicesNotFoundError") {
+        return "No camera found. Connect a camera and try again.";
+      }
+    }
+    return (err as Error).message || "Unable to access webcam.";
+  }
+
+  async function ensureCameraReady() {
+    if (streamRef.current && streamRef.current.getTracks().some((t) => t.readyState === "live")) {
+      if (videoRef.current) videoRef.current.srcObject = streamRef.current;
+      setStatus("Camera Ready");
+      return streamRef.current;
+    }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error("Webcam not supported in this browser.");
+    }
+    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    streamRef.current = stream;
+    if (videoRef.current) videoRef.current.srcObject = stream;
+    setStatus("Camera Ready");
+    return stream;
+  }
+
+  useEffect(() => {
+    ensureCameraReady().catch((err) => {
+      setStatus("Error");
+      setError(webcamErrorMessage(err));
+    });
+    return () => {
+      stopStream();
     };
   }, []);
 
@@ -132,58 +188,80 @@ export default function Page() {
     }
   }
 
-  async function handleWebcam() {
+  async function handleStartRecording() {
     setError("");
     setRealError(null);
     setResult(null);
-    if (!navigator.mediaDevices?.getUserMedia) {
-      setError("Webcam not supported in this browser.");
-      return;
-    }
     try {
-      setStatus("Recording");
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      const stream = await ensureCameraReady();
+      if (typeof MediaRecorder === "undefined") {
+        throw new Error("MediaRecorder not supported in this browser.");
+      }
+      chunksRef.current = [];
       const recorder = new MediaRecorder(stream);
-      const chunks: BlobPart[] = [];
+      recorderRef.current = recorder;
       recorder.ondataavailable = (evt) => {
-        if (evt.data.size > 0) chunks.push(evt.data);
+        if (evt.data.size > 0) chunksRef.current.push(evt.data);
       };
+      recorder.onstart = () => {
+        setIsRecording(true);
+        setStatus("Recording");
+      };
+      recorder.start();
+    } catch (err) {
+      setStatus("Error");
+      setError(webcamErrorMessage(err));
+    }
+  }
+
+  async function handleStopRecording() {
+    const recorder = recorderRef.current;
+    if (!recorder || recorder.state !== "recording") return;
+    setError("");
+    setRealError(null);
+    try {
       const stopPromise = new Promise<Blob>((resolve) => {
         recorder.onstop = () => {
-          const blob = new Blob(chunks, { type: recorder.mimeType || "video/webm" });
+          const blob = new Blob(chunksRef.current, { type: recorder.mimeType || "video/webm" });
           resolve(blob);
         };
       });
-      recorder.start();
-      await new Promise((r) => setTimeout(r, 2000));
       recorder.stop();
-      stream.getTracks().forEach((t) => t.stop());
-      const blob = await stopPromise;
-      const ext = blob.type.includes("webm") ? "webm" : "mp4";
-      const file = new File([blob], `webcam.${ext}`, { type: blob.type });
-      setStatus("Uploading");
-      const data = await postInfer(file, topk, mock, weightsPath, labelsPath);
+      setIsRecording(false);
       setStatus("Inferring");
+      const blob = await stopPromise;
+      const file = new File([blob], "webcam.webm", { type: blob.type || "video/webm" });
+      const data = await postInfer(file, topk, mock, weightsPath, labelsPath);
       setResult(data);
       setStatus("Done");
+      recorderRef.current = null;
+      chunksRef.current = [];
     } catch (err) {
+      setIsRecording(false);
       setStatus("Error");
       if (err instanceof ApiError && !mock) {
         setRealError({ error: err.error, hint: err.hint });
       } else {
-        setError((err as Error).message);
+        setError(webcamErrorMessage(err));
       }
     }
   }
 
   function handleReset() {
+    if (recorderRef.current && recorderRef.current.state === "recording") {
+      recorderRef.current.stop();
+    }
+    setIsRecording(false);
+    recorderRef.current = null;
+    chunksRef.current = [];
+    stopStream();
     setStatus("Idle");
     setResult(null);
     setError("");
     setRealError(null);
   }
 
-  const top1 = result?.topk?.[0];
+  const top1 = result?.top1;
 
   return (
     <div className="page stack">
@@ -265,10 +343,25 @@ export default function Page() {
       </div>
 
       <div className="card stack">
-        <h2>Record 2s Webcam</h2>
+        <h2>Webcam</h2>
+        <video
+          ref={videoRef}
+          autoPlay
+          muted
+          playsInline
+          className="panel"
+          style={{ width: "100%", maxHeight: 320, objectFit: "cover" }}
+        />
         <div className="row">
-          <button className="button secondary" onClick={handleWebcam} disabled={busy}>
-            Record & Infer
+          <button
+            className="button secondary"
+            onClick={handleStartRecording}
+            disabled={busy || isRecording}
+          >
+            Start Recording
+          </button>
+          <button className="button secondary" onClick={handleStopRecording} disabled={!isRecording}>
+            Stop Recording
           </button>
           <button className="button ghost" onClick={handleReset} disabled={busy && status !== "Error"}>
             Reset
@@ -280,7 +373,7 @@ export default function Page() {
         <h2>Status</h2>
         <div className="row">
           <div className={`status ${status === "Error" ? "bad" : "ok"}`}>{status}</div>
-          {result && <div className="subtle">File: {basename(result.input)}</div>}
+          {result?.input && <div className="subtle">File: {basename(result.input)}</div>}
         </div>
         {realError && !mock && (
           <div className="panel">
@@ -300,32 +393,39 @@ export default function Page() {
             <div className="row">
               <span className="badge">Top‑1</span>
               <div className="highlight">
-                {top1?.label} ({((top1?.prob ?? 0) * 100).toFixed(1)}%)
+                {top1?.label} ({((top1?.score ?? 0) * 100).toFixed(1)}%)
               </div>
+            </div>
+            <div className="panel subtle">
+              status={result.status} reason={result.reason ?? "n/a"} confidence_threshold=
+              {result.confidence_threshold.toFixed(2)} margin_threshold=
+              {result.margin_threshold.toFixed(2)}
             </div>
             <table className="table">
               <thead>
                 <tr>
                   <th>Rank</th>
                   <th>Label</th>
-                  <th>Prob</th>
+                  <th>Score</th>
                 </tr>
               </thead>
               <tbody>
-                {result.topk.map((item) => (
-                  <tr key={item.rank}>
-                    <td>{item.rank}</td>
+                {result.topk.map((item, idx) => (
+                  <tr key={`${item.label}-${idx}`}>
+                    <td>{idx + 1}</td>
                     <td>{item.label}</td>
-                    <td>{(item.prob * 100).toFixed(1)}%</td>
+                    <td>{(item.score * 100).toFixed(1)}%</td>
                   </tr>
                 ))}
               </tbody>
             </table>
-            <div className="panel subtle">
-              seed={result.meta.seed ?? "n/a"} temp={result.meta.temp ?? "n/a"} frames=
-              {result.meta.frames} fps={result.meta.fps ?? "n/a"} size=
-              {result.meta.width ?? "n/a"}x{result.meta.height ?? "n/a"}
-            </div>
+            {result.meta && (
+              <div className="panel subtle">
+                seed={result.meta.seed ?? "n/a"} temp={result.meta.temp ?? "n/a"} frames=
+                {result.meta.frames} fps={result.meta.fps ?? "n/a"} size=
+                {result.meta.width ?? "n/a"}x{result.meta.height ?? "n/a"}
+              </div>
+            )}
           </div>
         )}
       </div>
