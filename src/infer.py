@@ -13,6 +13,7 @@ from . import paths
 
 DEFAULT_NUM_LABELS = 100
 DEFAULT_NUM_FRAMES = 16
+MOCK_FALLBACK_LABELS = ["videos", "other", "misc", "alt", "bg", "noise", "dummy"]
 
 
 class InferenceError(Exception):
@@ -128,12 +129,23 @@ def mock_predict_probs(video_tensor: torch.Tensor, num_labels: int) -> tuple[np.
     seed = int.from_bytes(digest[:8], "little", signed=False)
     rng = np.random.default_rng(seed)
 
-    logits = rng.normal(0.0, 1.0, size=(num_labels,)).astype(np.float32)
-    peak_count = 3
-    peak_indices = rng.choice(num_labels, size=peak_count, replace=False)
-    boosts = [5.0, 2.0, 1.2]
-    for i, idx in enumerate(peak_indices):
-        logits[idx] += boosts[i]
+    if num_labels <= 0:
+        raise ValueError("num_labels must be >= 1")
+
+    # Build deterministic pseudo-scores, then map through softmax(log(score)).
+    score_weights = rng.uniform(0.01, 0.05, size=(num_labels,)).astype(np.float32)
+    if num_labels >= 2:
+        top2 = rng.choice(num_labels, size=2, replace=False)
+        s1 = 1.00 + float(rng.uniform(-0.02, 0.02))
+        s2 = 0.60 + float(rng.uniform(-0.02, 0.02))
+        if s2 >= s1:
+            s2 = max(0.01, s1 - 0.01)
+        score_weights[top2[0]] = np.float32(s1)
+        score_weights[top2[1]] = np.float32(s2)
+    else:
+        score_weights[0] = np.float32(0.80)
+
+    logits = np.log(np.maximum(score_weights, 1e-6))
 
     temperature = 0.95 + (seed % 26) / 100.0
     scaled = logits / temperature
@@ -211,6 +223,29 @@ def _adjust_topk_for_display(
     return display
 
 
+def decide_unknown(topk_list: list[dict], T: float, M: float) -> tuple[str, str | None]:
+    # Assumes topk_list sorted by score desc.
+    if len(topk_list) < 2:
+        return "unknown", "ambiguous"
+    top1_prob = float(topk_list[0]["score"])
+    if top1_prob < T:
+        return "unknown", "low_confidence"
+    top2_prob = float(topk_list[1]["score"])
+    if (top1_prob - top2_prob) < M:
+        return "unknown", "ambiguous"
+    return "ok", None
+
+
+def extract_topk(labels: list[str], probs: np.ndarray, topk: int) -> list[dict]:
+    if not labels:
+        return []
+    requested = max(1, int(topk))
+    min_required = min(2, len(labels))
+    k = min(len(labels), max(requested, min_required))
+    indices = np.argsort(-probs)[:k]
+    return [{"label": labels[int(idx)], "score": float(probs[int(idx)])} for idx in indices]
+
+
 def format_topk(labels: list[str], probs: np.ndarray, topk: int, mock_display: bool = False) -> str:
     topk = min(topk, len(labels))
     indices = np.argsort(-probs)[:topk]
@@ -243,6 +278,12 @@ def _infer_core(
     weights_p = Path(weights_path) if weights_path else paths.WEIGHTS_DIR / "model.ts"
 
     labels = load_labels(labels_p, max(1, int(num_classes)))
+    if mock and len(labels) < 2:
+        extended = [labels[0] if labels else MOCK_FALLBACK_LABELS[0]]
+        for candidate in MOCK_FALLBACK_LABELS:
+            if candidate not in extended:
+                extended.append(candidate)
+        labels = extended
     video_tensor, meta = decode_video_to_tensor(input_p)
 
     probs, seed, temp = run_inference(
@@ -271,6 +312,8 @@ def infer_video(
     weights_path: str | None = None,
     labels_path: str | None = None,
     num_classes: int = 100,
+    confidence_threshold: float = 0.50,
+    margin_threshold: float = 0.15,
 ) -> dict:
     probs, labels, meta, mode, _, _ = _infer_core(
         input_path=input_path,
@@ -281,25 +324,30 @@ def infer_video(
         num_classes=num_classes,
     )
 
-    topk = min(max(1, int(topk)), len(labels))
-    indices = np.argsort(-probs)[:topk]
-    topk_list = []
-    for rank, idx in enumerate(indices, start=1):
-        topk_list.append(
-            {
-                "rank": rank,
-                "label": labels[int(idx)],
-                "prob": float(probs[int(idx)]),
-            }
-        )
+    topk_list = extract_topk(labels, probs, topk)
+    top1_score = float(topk_list[0]["score"])
+    margin = None
+    if len(topk_list) >= 2:
+        margin = float(topk_list[0]["score"] - topk_list[1]["score"])
+    status, reason = decide_unknown(
+        topk_list,
+        T=float(confidence_threshold),
+        M=float(margin_threshold),
+    )
 
-    top1_idx = int(indices[0])
     return {
+        "status": status,
+        "reason": reason,
+        "top1": {
+            "label": topk_list[0]["label"],
+            "score": top1_score,
+        },
+        "topk": topk_list,
+        "margin": margin,
+        "confidence_threshold": float(confidence_threshold),
+        "margin_threshold": float(margin_threshold),
         "mode": mode,
         "input": input_path,
-        "pred_label": labels[top1_idx],
-        "pred_prob": float(probs[top1_idx]),
-        "topk": topk_list,
         "meta": meta,
     }
 
