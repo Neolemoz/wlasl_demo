@@ -12,7 +12,8 @@ from . import paths
 
 
 DEFAULT_NUM_LABELS = 100
-DEFAULT_NUM_FRAMES = 16
+MODEL_INPUT_FRAMES = 32
+DEFAULT_NUM_FRAMES = MODEL_INPUT_FRAMES
 MOCK_FALLBACK_LABELS = ["videos", "other", "misc", "alt", "bg", "noise", "dummy"]
 
 
@@ -62,46 +63,48 @@ def _resize_rgb(frame_bgr: np.ndarray, size: int = 224) -> np.ndarray:
     return frame
 
 
-def decode_video_to_tensor(video_path: Path, num_frames: int = DEFAULT_NUM_FRAMES) -> tuple[torch.Tensor, dict]:
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Failed to open video: {video_path}")
+def decode_video_to_tensor(video_path: Path, num_frames: int = MODEL_INPUT_FRAMES) -> tuple[torch.Tensor, dict]:
+    cap = None
+    frames: list[np.ndarray] = []
+    fps = None
+    width = None
+    height = None
+    try:
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise ValueError("DECODE_FAILED")
 
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = float(cap.get(cv2.CAP_PROP_FPS)) or None
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or None
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or None
-    frames = []
+        fps = float(cap.get(cv2.CAP_PROP_FPS)) or None
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or None
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or None
 
-    if total > 0:
-        indices = np.linspace(0, total - 1, num=num_frames, dtype=int)
-        for idx in indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                continue
-            frames.append(_resize_rgb(frame))
-    else:
         while True:
             ok, frame = cap.read()
             if not ok or frame is None:
                 break
             frames.append(_resize_rgb(frame))
-
-        if frames:
-            indices = np.linspace(0, len(frames) - 1, num=num_frames, dtype=int)
-            frames = [frames[i] for i in indices]
-
-    cap.release()
+    except Exception:
+        raise ValueError("DECODE_FAILED")
+    finally:
+        if cap is not None:
+            cap.release()
 
     if not frames:
-        raise ValueError("No frames read from video.")
+        raise ValueError("DECODE_FAILED")
+
+    total = len(frames)
+    if total >= num_frames:
+        indices = np.linspace(0, total - 1, num_frames).round().astype(int)
+        indices = np.clip(indices, 0, total - 1)
+        frames = [frames[int(i)] for i in indices]
+    else:
+        frames = frames * (num_frames // total) + frames[: (num_frames % total)]
 
     arr = np.stack(frames, axis=0)  # [T, H, W, C]
     arr = np.transpose(arr, (0, 3, 1, 2))  # [T, C, H, W]
     arr = np.expand_dims(arr, axis=0)  # [1, T, C, H, W]
     meta = {
-        "frames": len(frames),
+        "frames": int(num_frames),
         "fps": fps,
         "width": width,
         "height": height,
