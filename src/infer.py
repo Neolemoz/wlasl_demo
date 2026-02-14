@@ -318,6 +318,19 @@ def infer_video(
     confidence_threshold: float = 0.50,
     margin_threshold: float = 0.15,
 ) -> dict:
+    # --- AUTO num_classes from labels.json when REAL ---
+    if not mock:
+        try:
+            lp = Path(labels_path) if labels_path else (paths.WEIGHTS_DIR / "labels.json")
+            data = json.loads(lp.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                num_classes = len(data)
+            elif isinstance(data, dict) and data:
+                num_classes = max(int(k) for k in data.keys()) + 1
+        except Exception:
+            pass
+    # -----------------------------------------------
+
     probs, labels, meta, mode, _, _ = _infer_core(
         input_path=input_path,
         topk=topk,
