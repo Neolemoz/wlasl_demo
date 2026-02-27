@@ -18,3 +18,7 @@ cache/
 # Next.js
 web/.next/
 web/node_modules/
+
+# Local datasets
+my_demo_data/
+*.zip
