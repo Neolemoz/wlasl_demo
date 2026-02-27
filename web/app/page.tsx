@@ -44,14 +44,9 @@ async function postInfer(
   weights?: string,
   labels?: string
 ): Promise<InferResult> {
-  const params = new URLSearchParams({ topk: String(topk), mock: String(mock) });
-  if (!mock) {
-    if (weights) params.set("weights", weights);
-    if (labels) params.set("labels", labels);
-  }
   const form = new FormData();
   form.append("file", file);
-  const res = await fetch(`${API_BASE}/infer?${params.toString()}`, {
+  const res = await fetch("http://localhost:8000/infer?mock=false&topk=5", {
     method: "POST",
     body: form
   });
@@ -135,9 +130,16 @@ export default function Page() {
     return (err as Error).message || "Unable to access webcam.";
   }
 
+  function attachStreamToVideo(stream: MediaStream) {
+    if (!videoRef.current) return;
+    const video = videoRef.current;
+    video.srcObject = stream;
+    video.onloadedmetadata = () => video.play().catch(() => {});
+  }
+
   async function ensureCameraReady() {
     if (streamRef.current && streamRef.current.getTracks().some((t) => t.readyState === "live")) {
-      if (videoRef.current) videoRef.current.srcObject = streamRef.current;
+      attachStreamToVideo(streamRef.current);
       setStatus("Camera Ready");
       return streamRef.current;
     }
@@ -146,7 +148,7 @@ export default function Page() {
     }
     const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
     streamRef.current = stream;
-    if (videoRef.current) videoRef.current.srcObject = stream;
+    attachStreamToVideo(stream);
     setStatus("Camera Ready");
     return stream;
   }
@@ -265,6 +267,7 @@ export default function Page() {
 
   return (
     <div className="page stack">
+      <a href="/record">Go to Record Page</a>
       <div className="card stack">
         <div className="row space">
           <h1>WLASL Demo</h1>
@@ -344,14 +347,38 @@ export default function Page() {
 
       <div className="card stack">
         <h2>Webcam</h2>
-        <video
-          ref={videoRef}
-          autoPlay
-          muted
-          playsInline
-          className="panel"
-          style={{ width: "100%", maxHeight: 320, objectFit: "cover" }}
-        />
+        <div style={{ width: "100%", maxWidth: 960, margin: "0 auto" }}>
+          <div
+            style={{
+              border: "4px solid white",
+              borderRadius: 12,
+              overflow: "hidden",
+              background: "#000",
+            }}
+          >
+            <div
+              style={{
+                position: "relative",
+                width: "100%",
+                height: 480,
+              }}
+            >
+              <video
+                ref={videoRef}
+                autoPlay
+                muted
+                playsInline
+                style={{
+                  position: "absolute",
+                  inset: 0,
+                  width: "100%",
+                  height: "100%",
+                  objectFit: "contain",
+                }}
+              />
+            </div>
+          </div>
+        </div>
         <div className="row">
           <button
             className="button secondary"

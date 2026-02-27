@@ -12,9 +12,7 @@ from . import paths
 
 
 DEFAULT_NUM_LABELS = 100
-MODEL_INPUT_FRAMES = 32
-DEFAULT_NUM_FRAMES = MODEL_INPUT_FRAMES
-MOCK_FALLBACK_LABELS = ["videos", "other", "misc", "alt", "bg", "noise", "dummy"]
+DEFAULT_NUM_FRAMES = 16
 
 
 class InferenceError(Exception):
@@ -63,48 +61,46 @@ def _resize_rgb(frame_bgr: np.ndarray, size: int = 224) -> np.ndarray:
     return frame
 
 
-def decode_video_to_tensor(video_path: Path, num_frames: int = MODEL_INPUT_FRAMES) -> tuple[torch.Tensor, dict]:
-    cap = None
-    frames: list[np.ndarray] = []
-    fps = None
-    width = None
-    height = None
-    try:
-        cap = cv2.VideoCapture(str(video_path))
-        if not cap.isOpened():
-            raise ValueError("DECODE_FAILED")
+def decode_video_to_tensor(video_path: Path, num_frames: int = DEFAULT_NUM_FRAMES) -> tuple[torch.Tensor, dict]:
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open video: {video_path}")
 
-        fps = float(cap.get(cv2.CAP_PROP_FPS)) or None
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or None
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or None
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = float(cap.get(cv2.CAP_PROP_FPS)) or None
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or None
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or None
+    frames = []
 
+    if total > 0:
+        indices = np.linspace(0, total - 1, num=num_frames, dtype=int)
+        for idx in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+            frames.append(_resize_rgb(frame))
+    else:
         while True:
             ok, frame = cap.read()
             if not ok or frame is None:
                 break
             frames.append(_resize_rgb(frame))
-    except Exception:
-        raise ValueError("DECODE_FAILED")
-    finally:
-        if cap is not None:
-            cap.release()
+
+        if frames:
+            indices = np.linspace(0, len(frames) - 1, num=num_frames, dtype=int)
+            frames = [frames[i] for i in indices]
+
+    cap.release()
 
     if not frames:
-        raise ValueError("DECODE_FAILED")
-
-    total = len(frames)
-    if total >= num_frames:
-        indices = np.linspace(0, total - 1, num_frames).round().astype(int)
-        indices = np.clip(indices, 0, total - 1)
-        frames = [frames[int(i)] for i in indices]
-    else:
-        frames = frames * (num_frames // total) + frames[: (num_frames % total)]
+        raise ValueError("No frames read from video.")
 
     arr = np.stack(frames, axis=0)  # [T, H, W, C]
     arr = np.transpose(arr, (0, 3, 1, 2))  # [T, C, H, W]
     arr = np.expand_dims(arr, axis=0)  # [1, T, C, H, W]
     meta = {
-        "frames": int(num_frames),
+        "frames": len(frames),
         "fps": fps,
         "width": width,
         "height": height,
@@ -127,28 +123,46 @@ def _fingerprint_from_tensor(video_tensor: torch.Tensor) -> np.ndarray:
 
 
 def mock_predict_probs(video_tensor: torch.Tensor, num_labels: int) -> tuple[np.ndarray, int, float]:
-    features = _fingerprint_from_tensor(video_tensor)
-    digest = hashlib.sha256(features.tobytes()).digest()
+    """
+    Deterministic mock probabilities.
+    - Always produces at least 2 meaningful candidates if possible.
+    - Top1 ~0.80
+    - Top2 ~0.75
+    - Others smaller.
+    """
+    digest = hashlib.sha256(video_tensor.numpy().tobytes()).digest()
     seed = int.from_bytes(digest[:8], "little", signed=False)
     rng = np.random.default_rng(seed)
 
-    if num_labels <= 0:
-        raise ValueError("num_labels must be >= 1")
+    # Ensure at least 2 labels for realistic testing
+    if num_labels < 2:
+        num_labels = 2
 
-    # Build deterministic pseudo-scores, then map through softmax(log(score)).
-    score_weights = rng.uniform(0.01, 0.05, size=(num_labels,)).astype(np.float32)
+    probs = np.zeros(num_labels, dtype=np.float32)
+
+    # Deterministic base variation from seed
+    base_top1 = 0.80 + rng.uniform(-0.02, 0.02)
+    base_top2 = 0.75 + rng.uniform(-0.02, 0.02)
+
+    probs[0] = base_top1
+    probs[1] = base_top2
+
+    # Remaining labels get small values
+    for i in range(2, num_labels):
+        probs[i] = rng.uniform(0.01, 0.05)
+
+    # Normalize
+    probs = probs / probs.sum()
+
+    temperature = 1.0
+    return probs.astype(np.float32), seed, temperature
+
+
+    logits = rng.normal(-5.0, 0.7, size=(num_labels,)).astype(np.float32)
     if num_labels >= 2:
-        top2 = rng.choice(num_labels, size=2, replace=False)
-        s1 = 1.00 + float(rng.uniform(-0.02, 0.02))
-        s2 = 0.60 + float(rng.uniform(-0.02, 0.02))
-        if s2 >= s1:
-            s2 = max(0.01, s1 - 0.01)
-        score_weights[top2[0]] = np.float32(s1)
-        score_weights[top2[1]] = np.float32(s2)
-    else:
-        score_weights[0] = np.float32(0.80)
-
-    logits = np.log(np.maximum(score_weights, 1e-6))
+        peak_indices = rng.choice(num_labels, size=2, replace=False)
+        logits[peak_indices[0]] = 3.0
+        logits[peak_indices[1]] = 2.7
 
     temperature = 0.95 + (seed % 26) / 100.0
     scaled = logits / temperature
@@ -281,12 +295,6 @@ def _infer_core(
     weights_p = Path(weights_path) if weights_path else paths.WEIGHTS_DIR / "model.ts"
 
     labels = load_labels(labels_p, max(1, int(num_classes)))
-    if mock and len(labels) < 2:
-        extended = [labels[0] if labels else MOCK_FALLBACK_LABELS[0]]
-        for candidate in MOCK_FALLBACK_LABELS:
-            if candidate not in extended:
-                extended.append(candidate)
-        labels = extended
     video_tensor, meta = decode_video_to_tensor(input_p)
 
     probs, seed, temp = run_inference(
@@ -342,9 +350,6 @@ def infer_video(
 
     topk_list = extract_topk(labels, probs, topk)
     top1_score = float(topk_list[0]["score"])
-    margin = None
-    if len(topk_list) >= 2:
-        margin = float(topk_list[0]["score"] - topk_list[1]["score"])
     status, reason = decide_unknown(
         topk_list,
         T=float(confidence_threshold),
@@ -359,7 +364,6 @@ def infer_video(
             "score": top1_score,
         },
         "topk": topk_list,
-        "margin": margin,
         "confidence_threshold": float(confidence_threshold),
         "margin_threshold": float(margin_threshold),
         "mode": mode,

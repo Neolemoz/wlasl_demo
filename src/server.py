@@ -1,11 +1,13 @@
 import os
+import re
 import subprocess
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 
-from fastapi import FastAPI, File, Request, UploadFile
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -83,6 +85,10 @@ def _probe_duration_seconds(video_path: Path) -> float | None:
         return None
 
 
+def _sanitize_label(raw_label: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "", (raw_label or "").strip())
+
+
 @app.post("/infer")
 async def infer(
     request: Request,
@@ -91,9 +97,9 @@ async def infer(
     mock: bool = True,
     weights: str = "weights/model.ts",
     labels: str = "weights/labels.json",
-    num_classes: int = 100,
-    confidence_threshold: float = 0.50,
-    margin_threshold: float = 0.15,
+    num_classes: int = 3,
+    confidence_threshold: float = 0.01,
+    margin_threshold: float = 0.00001,
 ) -> dict:
     out_path: Path | None = None
     response: dict | JSONResponse | None = None
@@ -221,3 +227,145 @@ async def infer(
     if response is None:
         response = _json_error(status_code=400, error="BAD_REQUEST", code="BAD_REQUEST")
     return response
+
+
+@app.post("/upload_clip", response_model=None)
+async def upload_clip(
+    request: Request,
+    label: str = Form(...),
+    file: UploadFile = File(...),
+) -> dict:
+    out_path: Path | None = None
+    response: dict | JSONResponse | None = None
+    duration_seconds: float | None = None
+    saved_successfully = False
+    try:
+        client_ip = request.client.host if request.client and request.client.host else "unknown"
+        if _is_rate_limited(client_ip):
+            response = _json_error(
+                status_code=429,
+                error="Rate limit exceeded",
+                code="RATE_LIMITED",
+                hint="Try again later",
+            )
+        else:
+            sanitized_label = _sanitize_label(label)
+            if not sanitized_label:
+                response = _json_error(
+                    status_code=400,
+                    error="invalid label",
+                    code="BAD_REQUEST",
+                    hint="Use only letters, numbers, underscore, or hyphen.",
+                )
+            elif not file.filename:
+                response = _json_error(
+                    status_code=400,
+                    error="missing filename",
+                    code="BAD_REQUEST",
+                    hint="Provide a file upload.",
+                )
+            else:
+                name = file.filename.lower()
+                if not (name.endswith(".mp4") or name.endswith(".webm")):
+                    response = _json_error(
+                        status_code=400,
+                        error="unsupported file type",
+                        code="BAD_EXTENSION",
+                        hint="Upload .mp4 or .webm.",
+                    )
+                else:
+                    content_length = request.headers.get("content-length")
+                    if content_length:
+                        try:
+                            if int(content_length) > MAX_UPLOAD_BYTES:
+                                response = _json_error(
+                                    status_code=400, error="File too large", code="FILE_TOO_LARGE"
+                                )
+                        except ValueError:
+                            pass
+
+                if response is None:
+                    default_demo_root = paths.OUTPUTS_DIR / "demo_clips"
+                    demo_save_root = Path(os.getenv("DEMO_SAVE_ROOT", str(default_demo_root)))
+                    target_dir = demo_save_root / sanitized_label
+                    os.makedirs(target_dir, exist_ok=True)
+
+                    suffix = ".webm" if name.endswith(".webm") else ".mp4"
+                    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                    out_path = target_dir / f"{sanitized_label}_{timestamp}_{uuid.uuid4().hex[:8]}{suffix}"
+
+                    total_written = 0
+                    with out_path.open("wb") as f:
+                        while True:
+                            chunk = await file.read(UPLOAD_CHUNK_SIZE)
+                            if not chunk:
+                                break
+                            total_written += len(chunk)
+                            if total_written > MAX_UPLOAD_BYTES:
+                                try:
+                                    out_path.unlink()
+                                except FileNotFoundError:
+                                    pass
+                                except Exception:
+                                    pass
+                                response = _json_error(
+                                    status_code=400, error="File too large", code="FILE_TOO_LARGE"
+                                )
+                                break
+                            f.write(chunk)
+
+                    if response is None:
+                        duration_seconds = _probe_duration_seconds(out_path)
+                        if duration_seconds is not None and duration_seconds > MAX_DURATION_SECONDS:
+                            try:
+                                out_path.unlink()
+                            except FileNotFoundError:
+                                pass
+                            except Exception:
+                                pass
+                            response = _json_error(
+                                status_code=400,
+                                error="Video too long",
+                                code="DURATION_TOO_LONG",
+                                hint="Max 10s",
+                            )
+
+                    if response is None:
+                        saved_successfully = True
+                        response = {
+                            "ok": True,
+                            "label": sanitized_label,
+                            "path": str(out_path),
+                            "bytes": total_written,
+                            "duration": duration_seconds,
+                        }
+    except Exception as exc:
+        if out_path is not None and not saved_successfully:
+            try:
+                out_path.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+        response = _json_error(
+            status_code=400,
+            error=f"Failed to save upload: {exc}",
+            code="SAVE_FAIL",
+        )
+    finally:
+        await file.close()
+    if response is None:
+        response = _json_error(status_code=400, error="BAD_REQUEST", code="BAD_REQUEST")
+    return response
+
+
+@app.get("/demo_labels")
+def demo_labels() -> dict:
+    raw = os.getenv("DEMO_LABELS", "")
+    labels = [item.strip() for item in raw.split(",") if item.strip()]
+    return {"ok": True, "labels": labels}
+
+
+# Example curl:
+# curl -F "label=go" -F "file=@clip.webm" http://localhost:8000/upload_clip
+# curl http://localhost:8000/demo_labels
